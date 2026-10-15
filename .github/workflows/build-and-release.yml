@@ -1,0 +1,118 @@
+name: Build and release Tampermonkey userscript
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2026-10-15). Leave empty to default to vYYYY-MM-DD'
+        required: false
+        default: ''
+      release_name:
+        description: 'Release title (optional)'
+        required: false
+        default: ''
+      release_notes:
+        description: 'Release notes/body (optional)'
+        required: false
+        default: ''
+      draft:
+        description: 'Create as draft? (true/false)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build userscript
+        id: build
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="v$(date +%F)"; fi
+          VERSION="${TAG#v}"
+          echo "Building userscript for version $VERSION (tag $TAG)"
+          # Compose the userscript by embedding CSS + main + sw + content scripts.
+          # Read files if present; fallback to empty strings if not.
+          css=$(cat extension/src/content.css 2>/dev/null || true)
+          main=$(cat extension/src/main.js 2>/dev/null || true)
+          sw=$(cat extension/src/sw.js 2>/dev/null || true)
+          content=$(cat extension/src/content.js 2>/dev/null || true)
+
+          cat > desktop_gifs.user.js <<'EOF'
+// ==UserScript==
+// @name        Desktop GIFs (YouTube) — Tampermonkey standalone
+// @namespace   https://github.com/${{ github.repository }}
+// @version     ${VERSION}
+// @description Post GIFs in YouTube comments and replies from a desktop browser. Built by workflow.
+// @match       https://www.youtube.com/*
+// @grant       GM_xmlhttpRequest
+// @grant       GM.getValue
+// @grant       GM.setValue
+// @grant       GM_addValueChangeListener
+// @grant       GM_notification
+// @grant       GM_download
+// @grant       GM_registerMenuCommand
+// @grant       unsafeWindow
+// @run-at      document-start
+// ==/UserScript==
+
+;(function () {
+  'use strict';
+  // Inject CSS
+  try {
+    const s = document.createElement('style');
+    s.textContent = `$(printf '%s' "$css" | sed 's/`/\\`/g')`;
+    document.documentElement.appendChild(s);
+  } catch (e) {}
+
+  // Inject page hook (main.js) into page context
+  try {
+    const script = document.createElement('script');
+    script.textContent = `$(printf '%s' "$main" | sed 's/`/\\`/g')`;
+    document.documentElement.appendChild(script);
+    script.remove();
+  } catch (e) {}
+
+  // Provide background/sw logic and content logic inside the userscript context.
+  // The script concatenates sw.js logic and content.js logic so UI can call sw functions.
+  try {
+$(printf '%s' "$sw" | sed -e 's/^/    /')
+  } catch (e) {}
+
+  try {
+$(printf '%s' "$content" | sed -e 's/^/    /')
+  } catch (e) {}
+})();
+EOF
+
+          echo "::set-output name=tag::$TAG"
+          echo "Wrote desktop_gifs.user.js"
+      - name: Create GitHub release
+        id: create_release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.build.outputs.tag }}"
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          if [ -z "$RELEASE_NAME" ]; then RELEASE_NAME="Desktop GIFs — Tampermonkey ${TAG}"; fi
+          RELEASE_NOTES="${{ github.event.inputs.release_notes }}"
+          DRAFT="${{ github.event.inputs.draft }}"
+          # Create release via API
+          data=$(jq -n --arg tag "$TAG" --arg name "$RELEASE_NAME" --arg body "$RELEASE_NOTES" --argjson draft "$( [ "$DRAFT" = "true" ] && echo true || echo false )" '{ tag_name:$tag, name:$name, body:$body, draft:$draft, prerelease:false }')
+          resp=$(curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/${{ github.repository }}/releases -d "$data")
+          upload_url=$(echo "$resp" | jq -r .upload_url | sed -e 's/{?name,label}//')
+          echo "Release created: $upload_url"
+          echo "::set-output name=upload_url::$upload_url"
+      - name: Upload userscript asset
+        run: |
+          set -euo pipefail
+          upload_url="${{ steps.create_release.outputs.upload_url }}"
+          if [ -z "$upload_url" ] || [ "$upload_url" = "null" ]; then echo "No upload_url from release creation"; exit 1; fi
+          curl -sL -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/javascript" --data-binary @desktop_gifs.user.js "${upload_url}?name=desktop_gifs.user.js" \
+            | jq -r '"Uploaded asset: \(.name) (url: \(.browser_download_url))"'
